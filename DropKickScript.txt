@@ -1,4 +1,3 @@
-```lua
 -- dọn dẹp hệ thống cũ nếu có hoạt động
 if _G.EmoteFling_GlobalCleanup then
     pcall(function() _G.EmoteFling_GlobalCleanup() end)
