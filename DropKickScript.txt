@@ -1,0 +1,1513 @@
+-- dọn dẹp hệ thống cũ nếu có hoạt động
+if _G.EmoteFling_GlobalCleanup then
+    pcall(function() _G.EmoteFling_GlobalCleanup() end)
+end
+
+-- ============================================================================
+-- DỊCH VỤ & TRẠNG THÁI HỆ THỐNG
+-- ============================================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+
+local ModuleState = _G.ModuleState or { EmoteFlingActive = false, TurboFlingActive = false }
+_G.ModuleState = ModuleState
+
+-- Cấu hình mặc định
+local EmoteFlingConfig = {
+    Armed = true,
+    AnimId = "123284315754700", -- Mặc định: Idle mới
+    Speed = 16,
+    Active = false,
+    Resolving = false,
+    UseCustomId = false,
+    CustomId = "",
+    ToggleKey = Enum.KeyCode.X,
+    QuickFireKey = Enum.KeyCode.T,
+    NotificationsEnabled = true,
+    antiFallEnabled = true,
+    godEnabled = true,
+    antiFlingEnabled = true,
+    noclipEnabled = true,
+}
+
+local EmoteFlingTrack = nil
+local lastFireTime = 0
+local FIRE_COOLDOWN = 1
+local UI_Loaded = false
+
+-- Danh sách hoạt ảnh yêu cầu
+local PresetAnimations = {
+    ["Idle"] = "123284315754700",
+    ["Punch"] = "73053491533472",
+    ["Kick"] = "118139885865308",
+    ["Spin Kick"] = "82430395800667"
+}
+
+local PresetNames = { "Idle", "Punch", "Kick", "Spin Kick" }
+local CONFIG_FILE = "emote_fling_aura.json"
+
+-- Trình quản lý kết nối chống rò rỉ bộ nhớ
+local EventConnections = {}
+local function RegisterConnection(name, conn)
+    if EventConnections[name] then
+        pcall(function() EventConnections[name]:Disconnect() end)
+    end
+    EventConnections[name] = conn
+end
+
+local function DisconnectConnection(name)
+    if EventConnections[name] then
+        pcall(function() EventConnections[name]:Disconnect() end)
+        EventConnections[name] = nil
+    end
+end
+
+-- ============================================================================
+-- HỆ THỐNG LƯU / TẢI CẤU HÌNH (CONFIG)
+-- ============================================================================
+local function SaveConfig()
+    local config = {
+        Armed = EmoteFlingConfig.Armed,
+        AnimId = EmoteFlingConfig.AnimId,
+        Speed = EmoteFlingConfig.Speed,
+        UseCustomId = EmoteFlingConfig.UseCustomId,
+        CustomId = EmoteFlingConfig.CustomId,
+        NotificationsEnabled = EmoteFlingConfig.NotificationsEnabled,
+        antiFallEnabled = EmoteFlingConfig.antiFallEnabled,
+        godEnabled = EmoteFlingConfig.godEnabled,
+        antiFlingEnabled = EmoteFlingConfig.antiFlingEnabled,
+        noclipEnabled = EmoteFlingConfig.noclipEnabled,
+        ToggleKey = (EmoteFlingConfig.ToggleKey and typeof(EmoteFlingConfig.ToggleKey) == "EnumItem") and EmoteFlingConfig.ToggleKey.Name or "X",
+        QuickFireKey = (EmoteFlingConfig.QuickFireKey and typeof(EmoteFlingConfig.QuickFireKey) == "EnumItem") and EmoteFlingConfig.QuickFireKey.Name or "T",
+    }
+    local jsonStr = HttpService:JSONEncode(config)
+    pcall(function() writefile(CONFIG_FILE, jsonStr) end)
+end
+
+local function LoadConfig()
+    local fileExists = false
+    if type(isfile) == "function" then
+        pcall(function() fileExists = isfile(CONFIG_FILE) end)
+    else
+        local ok, _ = pcall(function() return readfile(CONFIG_FILE) end)
+        fileExists = ok
+    end
+
+    if not fileExists then
+        SaveConfig()
+        return false
+    end
+
+    local ok, content = pcall(function() return readfile(CONFIG_FILE) end)
+    if ok and content and content ~= "" then
+        local decodeOk, config = pcall(function() return HttpService:JSONDecode(content) end)
+        if decodeOk and type(config) == "table" then
+            EmoteFlingConfig.Armed = config.Armed or false
+            EmoteFlingConfig.AnimId = config.AnimId or "123284315754700"
+            EmoteFlingConfig.Speed = config.Speed or 16
+            EmoteFlingConfig.UseCustomId = config.UseCustomId or false
+            EmoteFlingConfig.CustomId = config.CustomId or ""
+            EmoteFlingConfig.NotificationsEnabled = config.NotificationsEnabled ~= false
+            EmoteFlingConfig.antiFallEnabled = config.antiFallEnabled or false
+            EmoteFlingConfig.godEnabled = config.godEnabled or false
+            EmoteFlingConfig.antiFlingEnabled = config.antiFlingEnabled or false
+            EmoteFlingConfig.noclipEnabled = config.noclipEnabled or false
+            
+            if config.ToggleKey then
+                pcall(function() EmoteFlingConfig.ToggleKey = Enum.KeyCode[config.ToggleKey] end)
+            end
+            if config.QuickFireKey then
+                pcall(function() EmoteFlingConfig.QuickFireKey = Enum.KeyCode[config.QuickFireKey] end)
+            end
+            return true
+        end
+    end
+    SaveConfig()
+    return false
+end
+
+local ConfigLoaded = LoadConfig()
+
+local function GetPresetNameFromId(id)
+    for name, presetId in pairs(PresetAnimations) do
+        if presetId == id then return name end
+    end
+    return "Idle"
+end
+
+-- ============================================================================
+-- PHÂN TÍCH VÀ KIỂM TRA ID ANIMATION KHÁCH HÀNG
+-- ============================================================================
+local function ResolveAnimationId(rawId)
+    if not rawId or type(rawId) ~= "string" or rawId == "" or rawId:match("^%s*$") then return nil end
+    local numStr = rawId:match("%d+")
+    if not numStr then return nil end
+
+    local numId = tonumber(numStr)
+    local ok, info = pcall(function() return MarketplaceService:GetProductInfo(numId) end)
+    if ok and info then
+        if info.AssetTypeId ~= 24 and info.AssetTypeId ~= 61 then
+            return nil 
+        end
+    end
+
+    local getOk, objects = pcall(function() return game:GetObjects("rbxassetid://" .. numStr) end)
+    if getOk and type(objects) == "table" then
+        for _, obj in pairs(objects) do
+            if typeof(obj) == "Instance" then
+                if obj:IsA("Animation") then return obj.AnimationId end
+                local childAnim = obj:FindFirstChildWhichIsA("Animation", true)
+                if childAnim then return childAnim.AnimationId end
+            end
+        end
+    end
+
+    return "rbxassetid://" .. numStr
+end
+
+-- ============================================================================
+-- HỆ THỐNG GIAO DIỆN TỰ THIẾT KẾ (CUSTOM UI LIBRARY)
+-- ============================================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "CustomEmoteFlingUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+-- Thử lưu vào CoreGui để tránh bị reset, nếu lỗi thì lưu vào PlayerGui làm dự phòng
+local successGui, errGui = pcall(function()
+    ScreenGui.Parent = CoreGui
+end)
+if not successGui then
+    ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- Hệ thống Thông báo Tự chế (Custom Notifications Container)
+local NotificationContainer = Instance.new("Frame")
+NotificationContainer.Name = "NotificationContainer"
+NotificationContainer.Size = UDim2.new(0, 300, 1, -40)
+NotificationContainer.Position = UDim2.new(1, -320, 0, 20)
+NotificationContainer.BackgroundTransparency = 1
+NotificationContainer.Parent = ScreenGui
+
+local UIListNotification = Instance.new("UIListLayout")
+UIListNotification.VerticalAlignment = Enum.VerticalAlignment.Bottom
+UIListNotification.SortOrder = Enum.SortOrder.LayoutOrder
+UIListNotification.Padding = UDim.new(0, 10)
+UIListNotification.Parent = NotificationContainer
+
+local function Notify(title, message, duration)
+    if not EmoteFlingConfig.NotificationsEnabled then return end
+    duration = duration or 3
+    
+    local Card = Instance.new("Frame")
+    Card.Size = UDim2.new(1, 0, 0, 65)
+    Card.BackgroundColor3 = Color3.fromRGB(15, 20, 32)
+    Card.BorderSizePixel = 0
+    Card.ClipsDescendants = true
+    Card.BackgroundTransparency = 1 -- Sẽ tween mở rộng dần
+    
+    local CardCorner = Instance.new("UICorner")
+    CardCorner.CornerRadius = UDim.new(0, 8)
+    CardCorner.Parent = Card
+    
+    local Stroke = Instance.new("UIStroke")
+    Stroke.Color = Color3.fromRGB(0, 162, 255)
+    Stroke.Thickness = 1
+    Stroke.Transparency = 1
+    Stroke.Parent = Card
+
+    local TitleLabel = Instance.new("TextLabel")
+    TitleLabel.Size = UDim2.new(1, -20, 0, 25)
+    TitleLabel.Position = UDim2.new(0, 10, 0, 5)
+    TitleLabel.BackgroundTransparency = 1
+    TitleLabel.Font = Enum.Font.GothamBold
+    TitleLabel.Text = title
+    TitleLabel.TextColor3 = Color3.fromRGB(0, 162, 255)
+    TitleLabel.TextSize = 13
+    TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TitleLabel.Parent = Card
+
+    local ContentLabel = Instance.new("TextLabel")
+    ContentLabel.Size = UDim2.new(1, -20, 0, 30)
+    ContentLabel.Position = UDim2.new(0, 10, 0, 28)
+    ContentLabel.BackgroundTransparency = 1
+    ContentLabel.Font = Enum.Font.Gotham
+    ContentLabel.Text = message
+    ContentLabel.TextColor3 = Color3.fromRGB(200, 220, 240)
+    ContentLabel.TextSize = 11
+    ContentLabel.TextXAlignment = Enum.TextXAlignment.Left
+    ContentLabel.TextWrapped = true
+    ContentLabel.Parent = Card
+
+    Card.Parent = NotificationContainer
+    
+    -- Animation xuất hiện mượt mà
+    TweenService:Create(Card, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {BackgroundTransparency = 0.15}):Play()
+    TweenService:Create(Stroke, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Transparency = 0.5}):Play()
+    
+    task.delay(duration, function()
+        if Card then
+            local tw1 = TweenService:Create(Card, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0)})
+            local tw2 = TweenService:Create(Stroke, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {Transparency = 1})
+            tw1:Play()
+            tw2:Play()
+            tw1.Completed:Connect(function()
+                Card:Destroy()
+            end)
+        end
+    end)
+end
+
+-- Khung chính của UI (Main Frame)
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 330, 0, 480)
+MainFrame.Position = UDim2.new(0.5, -165, 0.5, -240)
+MainFrame.BackgroundColor3 = Color3.fromRGB(12, 16, 26)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 10)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(35, 45, 65)
+MainStroke.Thickness = 1.5
+MainStroke.Parent = MainFrame
+
+-- Hiệu ứng bóng phát sáng (Outer Glow)
+local GlowShadow = Instance.new("ImageLabel")
+GlowShadow.Name = "Shadow"
+GlowShadow.AnchorPoint = Vector2.new(0.5, 0.5)
+GlowShadow.Position = UDim2.new(0.5, 0, 0.5, 0)
+GlowShadow.Size = UDim2.new(1, 40, 1, 40)
+GlowShadow.BackgroundTransparency = 1
+GlowShadow.Image = "rbxassetid://6014261993"
+GlowShadow.ImageColor3 = Color3.fromRGB(0, 162, 255)
+GlowShadow.ImageTransparency = 0.85
+GlowShadow.ZIndex = MainFrame.ZIndex - 1
+GlowShadow.Parent = MainFrame
+
+-- Thanh Tiêu Đề (Header Frame - Kéo Thả)
+local Header = Instance.new("Frame")
+Header.Name = "Header"
+Header.Size = UDim2.new(1, 0, 0, 45)
+Header.BackgroundColor3 = Color3.fromRGB(18, 23, 37)
+Header.BorderSizePixel = 0
+Header.Parent = MainFrame
+
+local HeaderCorner = Instance.new("UICorner")
+HeaderCorner.CornerRadius = UDim.new(0, 10)
+HeaderCorner.Parent = Header
+
+-- Khung che phần bo góc dưới của Header
+local HeaderFix = Instance.new("Frame")
+HeaderFix.Name = "HeaderFix"
+HeaderFix.Size = UDim2.new(1, 0, 0, 10)
+HeaderFix.Position = UDim2.new(0, 0, 1, -10)
+HeaderFix.BackgroundColor3 = Color3.fromRGB(18, 23, 37)
+HeaderFix.BorderSizePixel = 0
+HeaderFix.Parent = Header
+
+local Title = Instance.new("TextLabel")
+Title.Name = "Title"
+Title.Size = UDim2.new(1, -80, 1, 0)
+Title.Position = UDim2.new(0, 15, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Font = Enum.Font.GothamBold
+Title.Text = "EMOTE FLING"
+Title.TextColor3 = Color3.fromRGB(240, 248, 255)
+Title.TextSize = 16
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Header
+
+local Subtitle = Instance.new("TextLabel")
+Subtitle.Name = "Subtitle"
+Subtitle.Size = UDim2.new(0, 150, 0, 15)
+Subtitle.Position = UDim2.new(0, 130, 0.5, -7)
+Subtitle.BackgroundTransparency = 1
+Subtitle.Font = Enum.Font.GothamSemibold
+Subtitle.Text = "| custom pure ui"
+Subtitle.TextColor3 = Color3.fromRGB(0, 162, 255)
+Subtitle.TextSize = 11
+Subtitle.TextXAlignment = Enum.TextXAlignment.Left
+Subtitle.Parent = Header
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Name = "CloseBtn"
+CloseBtn.Size = UDim2.new(0, 30, 0, 30)
+CloseBtn.Position = UDim2.new(1, -40, 0.5, -15)
+CloseBtn.BackgroundTransparency = 1
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.Text = "×"
+CloseBtn.TextColor3 = Color3.fromRGB(145, 165, 185)
+CloseBtn.TextSize = 24
+CloseBtn.Parent = Header
+
+CloseBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+    Notify("Giao diện ẩn", "Ấn phím [" .. EmoteFlingConfig.ToggleKey.Name .. "] để mở lại menu.", 3)
+end)
+
+CloseBtn.MouseEnter:Connect(function()
+    TweenService:Create(CloseBtn, TweenInfo.new(0.2), {TextColor3 = Color3.fromRGB(255, 100, 100)}):Play()
+end)
+CloseBtn.MouseLeave:Connect(function()
+    TweenService:Create(CloseBtn, TweenInfo.new(0.2), {TextColor3 = Color3.fromRGB(145, 165, 185)}):Play()
+end)
+
+-- Tạo tính năng kéo thả (Draggable) tự chế mượt mà
+local dragging
+local dragInput
+local dragStart
+local startPos
+
+local function update(input)
+    local delta = input.Position - dragStart
+    MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end
+
+Header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
+        
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+Header.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        update(input)
+    end
+end)
+
+-- Khung Cuộn chứa các thiết lập (ScrollContainer Frame)
+local ScrollFrame = Instance.new("ScrollingFrame")
+ScrollFrame.Name = "ScrollFrame"
+ScrollFrame.Size = UDim2.new(1, 0, 1, -45)
+ScrollFrame.Position = UDim2.new(0, 0, 0, 45)
+ScrollFrame.BackgroundTransparency = 1
+ScrollFrame.BorderSizePixel = 0
+ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, 680)
+ScrollFrame.ScrollBarThickness = 3
+ScrollFrame.ScrollBarImageColor3 = Color3.fromRGB(0, 162, 255)
+ScrollFrame.Parent = MainFrame
+
+local UIList = Instance.new("UIListLayout")
+UIList.SortOrder = Enum.SortOrder.LayoutOrder
+UIList.Padding = UDim.new(0, 12)
+UIList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+UIList.Parent = ScrollFrame
+
+-- Thêm khoảng đệm đầu trang
+local Padding = Instance.new("Frame")
+Padding.Size = UDim2.new(1, 0, 0, 5)
+Padding.BackgroundTransparency = 1
+Padding.LayoutOrder = 0
+Padding.Parent = ScrollFrame
+
+-- ============================================================================
+-- CÁC PHẦN TỬ THIẾT LẬP CHI TIẾT (UI ELEMENTS CREATION)
+-- ============================================================================
+
+local function CreateSection(name, order)
+    local Sec = Instance.new("Frame")
+    Sec.Size = UDim2.new(0.92, 0, 0, 22)
+    Sec.BackgroundTransparency = 1
+    Sec.LayoutOrder = order
+    Sec.Parent = ScrollFrame
+
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(1, 0, 1, 0)
+    Label.BackgroundTransparency = 1
+    Label.Font = Enum.Font.GothamBold
+    Label.Text = name:upper()
+    Label.TextColor3 = Color3.fromRGB(0, 162, 255)
+    Label.TextSize = 11
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Sec
+    
+    local Line = Instance.new("Frame")
+    Line.Size = UDim2.new(1, -Label.TextBounds.X - 10, 0, 1)
+    Line.Position = UDim2.new(0, Label.TextBounds.X + 10, 0.5, 0)
+    Line.BackgroundColor3 = Color3.fromRGB(35, 45, 65)
+    Line.BorderSizePixel = 0
+    Line.Parent = Sec
+end
+
+local function CreateToggle(name, default, order, callback)
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0.92, 0, 0, 36)
+    Frame.BackgroundColor3 = Color3.fromRGB(18, 23, 37)
+    Frame.BorderSizePixel = 0
+    Frame.LayoutOrder = order
+    Frame.Parent = ScrollFrame
+
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 6)
+    Corner.Parent = Frame
+    
+    local Stroke = Instance.new("UIStroke")
+    Stroke.Color = Color3.fromRGB(28, 35, 52)
+    Stroke.Thickness = 1
+    Stroke.Parent = Frame
+
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.7, 0, 1, 0)
+    Label.Position = UDim2.new(0, 10, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Font = Enum.Font.GothamSemibold
+    Label.Text = name
+    Label.TextColor3 = Color3.fromRGB(215, 225, 235)
+    Label.TextSize = 12
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Frame
+
+    local ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Size = UDim2.new(0, 42, 0, 20)
+    ToggleBtn.Position = UDim2.new(1, -52, 0.5, -10)
+    ToggleBtn.BackgroundColor3 = default and Color3.fromRGB(0, 162, 255) or Color3.fromRGB(30, 40, 58)
+    ToggleBtn.Text = ""
+    ToggleBtn.Parent = Frame
+
+    local BtnCorner = Instance.new("UICorner")
+    BtnCorner.CornerRadius = UDim.new(1, 0)
+    BtnCorner.Parent = ToggleBtn
+
+    local Dot = Instance.new("Frame")
+    Dot.Size = UDim2.new(0, 14, 0, 14)
+    Dot.Position = default and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+    Dot.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    Dot.BorderSizePixel = 0
+    Dot.Parent = ToggleBtn
+
+    local DotCorner = Instance.new("UICorner")
+    DotCorner.CornerRadius = UDim.new(1, 0)
+    DotCorner.Parent = Dot
+
+    local state = default
+    local animating = false
+
+    local function Toggle()
+        if animating then return end
+        animating = true
+        state = not state
+        
+        local targetColor = state and Color3.fromRGB(0, 162, 255) or Color3.fromRGB(30, 40, 58)
+        local targetPos = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+        
+        TweenService:Create(ToggleBtn, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {BackgroundColor3 = targetColor}):Play()
+        local tw = TweenService:Create(Dot, TweenInfo.new(0.2, Enum.EasingStyle.Back), {Position = targetPos})
+        tw:Play()
+        tw.Completed:Connect(function()
+            animating = false
+        end)
+        
+        task.spawn(function()
+            callback(state)
+        end)
+    end
+
+    ToggleBtn.MouseButton1Click:Connect(Toggle)
+    
+    local toggleController = {}
+    function toggleController:Set(val)
+        if state ~= val then
+            Toggle()
+        end
+    end
+    return toggleController
+end
+
+local function CreateSlider(name, min, max, default, order, callback)
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0.92, 0, 0, 48)
+    Frame.BackgroundColor3 = Color3.fromRGB(18, 23, 37)
+    Frame.BorderSizePixel = 0
+    Frame.LayoutOrder = order
+    Frame.Parent = ScrollFrame
+
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 6)
+    Corner.Parent = Frame
+    
+    local Stroke = Instance.new("UIStroke")
+    Stroke.Color = Color3.fromRGB(28, 35, 52)
+    Stroke.Thickness = 1
+    Stroke.Parent = Frame
+
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.6, 0, 0, 25)
+    Label.Position = UDim2.new(0, 10, 0, 2)
+    Label.BackgroundTransparency = 1
+    Label.Font = Enum.Font.GothamSemibold
+    Label.Text = name
+    Label.TextColor3 = Color3.fromRGB(215, 225, 235)
+    Label.TextSize = 12
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Frame
+
+    local ValLabel = Instance.new("TextLabel")
+    ValLabel.Size = UDim2.new(0.3, 0, 0, 25)
+    ValLabel.Position = UDim2.new(0.7, -10, 0, 2)
+    ValLabel.BackgroundTransparency = 1
+    ValLabel.Font = Enum.Font.GothamBold
+    ValLabel.Text = tostring(default)
+    ValLabel.TextColor3 = Color3.fromRGB(0, 162, 255)
+    ValLabel.TextSize = 12
+    ValLabel.TextXAlignment = Enum.TextXAlignment.Right
+    ValLabel.Parent = Frame
+
+    local SliderBar = Instance.new("Frame")
+    SliderBar.Size = UDim2.new(1, -20, 0, 5)
+    SliderBar.Position = UDim2.new(0, 10, 1, -12)
+    SliderBar.BackgroundColor3 = Color3.fromRGB(30, 40, 58)
+    SliderBar.BorderSizePixel = 0
+    SliderBar.Parent = Frame
+
+    local SliderCorner = Instance.new("UICorner")
+    SliderCorner.CornerRadius = UDim.new(1, 0)
+    SliderCorner.Parent = SliderBar
+
+    local Fill = Instance.new("Frame")
+    Fill.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
+    Fill.BackgroundColor3 = Color3.fromRGB(0, 162, 255)
+    Fill.BorderSizePixel = 0
+    Fill.Parent = SliderBar
+
+    local FillCorner = Instance.new("UICorner")
+    FillCorner.CornerRadius = UDim.new(1, 0)
+    FillCorner.Parent = Fill
+
+    local Button = Instance.new("TextButton")
+    Button.Size = UDim2.new(1, 0, 1, 0)
+    Button.BackgroundTransparency = 1
+    Button.Text = ""
+    Button.Parent = SliderBar
+
+    local active = false
+
+    local function UpdateVal(input)
+        local pos = math.clamp((input.Position.X - SliderBar.AbsolutePosition.X) / SliderBar.AbsoluteSize.X, 0, 1)
+        Fill.Size = UDim2.new(pos, 0, 1, 0)
+        local value = math.floor(min + (max - min) * pos)
+        ValLabel.Text = tostring(value)
+        callback(value)
+    end
+
+    Button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            active = true
+            UpdateVal(input)
+        end
+    end)
+
+    Button.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            active = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if active and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            UpdateVal(input)
+        end
+    end)
+end
+
+local function CreateInput(name, placeholder, default, order, callback)
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0.92, 0, 0, 40)
+    Frame.BackgroundColor3 = Color3.fromRGB(18, 23, 37)
+    Frame.BorderSizePixel = 0
+    Frame.LayoutOrder = order
+    Frame.Parent = ScrollFrame
+
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 6)
+    Corner.Parent = Frame
+    
+    local Stroke = Instance.new("UIStroke")
+    Stroke.Color = Color3.fromRGB(28, 35, 52)
+    Stroke.Thickness = 1
+    Stroke.Parent = Frame
+
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.4, 0, 1, 0)
+    Label.Position = UDim2.new(0, 10, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Font = Enum.Font.GothamSemibold
+    Label.Text = name
+    Label.TextColor3 = Color3.fromRGB(215, 225, 235)
+    Label.TextSize = 12
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Frame
+
+    local Box = Instance.new("TextBox")
+    Box.Size = UDim2.new(0.52, 0, 0, 24)
+    Box.Position = UDim2.new(0.48, -10, 0.5, -12)
+    Box.BackgroundColor3 = Color3.fromRGB(10, 14, 23)
+    Box.BorderSizePixel = 0
+    Box.Font = Enum.Font.Gotham
+    Box.PlaceholderText = placeholder
+    Box.PlaceholderColor3 = Color3.fromRGB(75, 90, 115)
+    Box.Text = default
+    Box.TextColor3 = Color3.fromRGB(0, 162, 255)
+    Box.TextSize = 11
+    Box.ClipsDescendants = true
+    Box.Parent = Frame
+
+    local BoxCorner = Instance.new("UICorner")
+    BoxCorner.CornerRadius = UDim.new(0, 4)
+    BoxCorner.Parent = Box
+    
+    local BoxStroke = Instance.new("UIStroke")
+    BoxStroke.Color = Color3.fromRGB(28, 35, 52)
+    BoxStroke.Thickness = 1
+    BoxStroke.Parent = Box
+
+    Box.Focused:Connect(function()
+        TweenService:Create(BoxStroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(0, 162, 255)}):Play()
+    end)
+    Box.FocusLost:Connect(function()
+        TweenService:Create(BoxStroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(28, 35, 52)}):Play()
+        callback(Box.Text)
+    end)
+end
+
+local function CreateDropdown(name, options, default, order, callback)
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0.92, 0, 0, 40)
+    Frame.BackgroundColor3 = Color3.fromRGB(18, 23, 37)
+    Frame.BorderSizePixel = 0
+    Frame.ClipsDescendants = true
+    Frame.LayoutOrder = order
+    Frame.Parent = ScrollFrame
+
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 6)
+    Corner.Parent = Frame
+    
+    local Stroke = Instance.new("UIStroke")
+    Stroke.Color = Color3.fromRGB(28, 35, 52)
+    Stroke.Thickness = 1
+    Stroke.Parent = Frame
+
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.4, 0, 0, 40)
+    Label.Position = UDim2.new(0, 10, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Font = Enum.Font.GothamSemibold
+    Label.Text = name
+    Label.TextColor3 = Color3.fromRGB(215, 225, 235)
+    Label.TextSize = 12
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Frame
+
+    local SelectedBtn = Instance.new("TextButton")
+    SelectedBtn.Size = UDim2.new(0.52, 0, 0, 26)
+    SelectedBtn.Position = UDim2.new(0.48, -10, 0, 7)
+    SelectedBtn.BackgroundColor3 = Color3.fromRGB(25, 33, 50)
+    SelectedBtn.BorderSizePixel = 0
+    SelectedBtn.Font = Enum.Font.GothamBold
+    SelectedBtn.Text = default
+    SelectedBtn.TextColor3 = Color3.fromRGB(0, 162, 255)
+    SelectedBtn.TextSize = 11
+    SelectedBtn.Parent = Frame
+
+    local BtnCorner = Instance.new("UICorner")
+    BtnCorner.CornerRadius = UDim.new(0, 4)
+    BtnCorner.Parent = SelectedBtn
+
+    local ListFrame = Instance.new("Frame")
+    ListFrame.Size = UDim2.new(1, -20, 0, #options * 28 + 5)
+    ListFrame.Position = UDim2.new(0, 10, 0, 45)
+    ListFrame.BackgroundColor3 = Color3.fromRGB(10, 14, 23)
+    ListFrame.BorderSizePixel = 0
+    ListFrame.Visible = false
+    ListFrame.Parent = Frame
+
+    local ListCorner = Instance.new("UICorner")
+    ListCorner.CornerRadius = UDim.new(0, 4)
+    ListCorner.Parent = ListFrame
+
+    local ListLayout = Instance.new("UIListLayout")
+    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    ListLayout.Padding = UDim.new(0, 2)
+    ListLayout.Parent = ListFrame
+
+    local open = false
+
+    local function ToggleDrop()
+        open = not open
+        if open then
+            ListFrame.Visible = true
+            TweenService:Create(Frame, TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Size = UDim2.new(0.92, 0, 0, 45 + ListFrame.Size.Y.Offset)}):Play()
+        else
+            local tw = TweenService:Create(Frame, TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Size = UDim2.new(0.92, 0, 0, 40)})
+            tw:Play()
+            tw.Completed:Connect(function()
+                if not open then ListFrame.Visible = false end
+            end)
+        end
+    end
+
+    SelectedBtn.MouseButton1Click:Connect(ToggleDrop)
+
+    for i, opt in ipairs(options) do
+        local OptBtn = Instance.new("TextButton")
+        OptBtn.Size = UDim2.new(1, 0, 0, 26)
+        OptBtn.BackgroundTransparency = 1
+        OptBtn.Font = Enum.Font.GothamSemibold
+        OptBtn.Text = opt
+        OptBtn.TextColor3 = Color3.fromRGB(180, 195, 210)
+        OptBtn.TextSize = 11
+        OptBtn.LayoutOrder = i
+        OptBtn.Parent = ListFrame
+
+        OptBtn.MouseButton1Click:Connect(function()
+            SelectedBtn.Text = opt
+            ToggleDrop()
+            callback(opt)
+        end)
+
+        OptBtn.MouseEnter:Connect(function()
+            TweenService:Create(OptBtn, TweenInfo.new(0.2), {TextColor3 = Color3.fromRGB(0, 162, 255)}):Play()
+        end)
+        OptBtn.MouseLeave:Connect(function()
+            TweenService:Create(OptBtn, TweenInfo.new(0.2), {TextColor3 = Color3.fromRGB(180, 195, 210)}):Play()
+        end)
+    end
+end
+
+local function CreateButton(name, order, callback)
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0.92, 0, 0, 38)
+    Frame.BackgroundTransparency = 1
+    Frame.BorderSizePixel = 0
+    Frame.LayoutOrder = order
+    Frame.Parent = ScrollFrame
+
+    local Btn = Instance.new("TextButton")
+    Btn.Size = UDim2.new(1, 0, 1, 0)
+    Btn.BackgroundColor3 = Color3.fromRGB(0, 130, 255)
+    Btn.Font = Enum.Font.GothamBold
+    Btn.Text = name:upper()
+    Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Btn.TextSize = 12
+    Btn.Parent = Frame
+
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 6)
+    Corner.Parent = Btn
+    
+    local Glow = Instance.new("UIStroke")
+    Glow.Color = Color3.fromRGB(255, 255, 255)
+    Glow.Thickness = 1
+    Glow.Transparency = 0.8
+    Glow.Parent = Btn
+
+    Btn.MouseButton1Click:Connect(function()
+        -- Hiệu ứng nhấn nút nhẹ
+        TweenService:Create(Btn, TweenInfo.new(0.1, Enum.EasingStyle.Quad), {BackgroundColor3 = Color3.fromRGB(0, 95, 200)}):Play()
+        task.delay(0.1, function()
+            TweenService:Create(Btn, TweenInfo.new(0.1, Enum.EasingStyle.Quad), {BackgroundColor3 = Color3.fromRGB(0, 130, 255)}):Play()
+        end)
+        callback()
+    end)
+end
+
+local function CreateKeybind(name, default, order, callback)
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0.92, 0, 0, 36)
+    Frame.BackgroundColor3 = Color3.fromRGB(18, 23, 37)
+    Frame.BorderSizePixel = 0
+    Frame.LayoutOrder = order
+    Frame.Parent = ScrollFrame
+
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 6)
+    Corner.Parent = Frame
+    
+    local Stroke = Instance.new("UIStroke")
+    Stroke.Color = Color3.fromRGB(28, 35, 52)
+    Stroke.Thickness = 1
+    Stroke.Parent = Frame
+
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.5, 0, 1, 0)
+    Label.Position = UDim2.new(0, 10, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Font = Enum.Font.GothamSemibold
+    Label.Text = name
+    Label.TextColor3 = Color3.fromRGB(215, 225, 235)
+    Label.TextSize = 12
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Frame
+
+    local BindBtn = Instance.new("TextButton")
+    BindBtn.Size = UDim2.new(0, 80, 0, 24)
+    BindBtn.Position = UDim2.new(1, -90, 0.5, -12)
+    BindBtn.BackgroundColor3 = Color3.fromRGB(25, 33, 48)
+    BindBtn.BorderSizePixel = 0
+    BindBtn.Font = Enum.Font.GothamBold
+    BindBtn.Text = default and default.Name or "None"
+    BindBtn.TextColor3 = Color3.fromRGB(0, 162, 255)
+    BindBtn.TextSize = 11
+    BindBtn.Parent = Frame
+
+    local BtnCorner = Instance.new("UICorner")
+    BtnCorner.CornerRadius = UDim.new(0, 4)
+    BtnCorner.Parent = BindBtn
+
+    local listening = false
+
+    BindBtn.MouseButton1Click:Connect(function()
+        if listening then return end
+        listening = true
+        BindBtn.Text = "..."
+        BindBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+        
+        local tempConn
+        tempConn = UserInputService.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Keyboard then
+                local key = input.KeyCode
+                if key ~= Enum.KeyCode.Unknown then
+                    listening = false
+                    BindBtn.Text = key.Name
+                    BindBtn.TextColor3 = Color3.fromRGB(0, 162, 255)
+                    callback(key)
+                    if tempConn then tempConn:Disconnect() end
+                end
+            end
+        end)
+    end)
+end
+
+-- ============================================================================
+-- PHẦN KHỞI CHẠY CLEANUP CỦA EMOTE FLING
+-- ============================================================================
+local function EmoteFlingCleanup()
+    EmoteFlingConfig.Active = false
+    ModuleState.EmoteFlingActive = false
+
+    if EmoteFlingTrack then
+        pcall(function() EmoteFlingTrack:Stop() end)
+        EmoteFlingTrack = nil
+    end
+
+    local char = LocalPlayer.Character
+    if char then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            hrp.Velocity = Vector3.zero
+            hrp.RotVelocity = Vector3.zero
+        end
+    end
+end
+
+-- ============================================================================
+-- HOẠT ĐỘNG CHÍNH CỦA EMOTE FLING
+-- ============================================================================
+local function FireEmoteFling()
+    local now = tick()
+    if now - lastFireTime < FIRE_COOLDOWN then return end
+    lastFireTime = now
+
+    if EmoteFlingConfig.Resolving then
+        Notify("Emote Fling", "Đang xử lý hoạt ảnh, vui lòng đợi...", 2)
+        return
+    end
+
+    if EmoteFlingConfig.Active then
+        EmoteFlingConfig.Active = false 
+        return
+    end
+
+    if not EmoteFlingConfig.Armed then
+        Notify("Emote Fling", "Bộ kích hoạt Fling chưa bật. Hãy kích hoạt trước.", 2)
+        return
+    end
+
+    local targetId = EmoteFlingConfig.AnimId
+    if type(targetId) ~= "string" or targetId == "" or targetId:match("^%s*$") then
+        Notify("Emote Fling", "Không có Animation ID hợp lệ.", 2)
+        return
+    end
+
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+
+    if not (hrp and hum) then
+        Notify("Emote Fling", "Không tìm thấy Nhân vật.", 2)
+        return
+    end
+
+    EmoteFlingConfig.Resolving = true
+    Notify("Emote Fling", "Đang tải Animation...", 1.5)
+
+    task.spawn(function()
+        local finalAnimId = ResolveAnimationId(targetId)
+        EmoteFlingConfig.Resolving = false
+
+        if not finalAnimId then
+            Notify("Emote Fling", "ID không hợp lệ! Hãy chắc chắn đó là Animation hợp lý.", 3)
+            return
+        end
+
+        char = LocalPlayer.Character
+        hrp = char and char:FindFirstChild("HumanoidRootPart")
+        hum = char and char:FindFirstChildWhichIsA("Humanoid")
+        if not (hrp and hum) then return end
+
+        local anim = Instance.new("Animation")
+        anim.AnimationId = finalAnimId
+
+        local trackOk, track = pcall(function() return hum:LoadAnimation(anim) end)
+
+        if not trackOk or not track then
+            Notify("Emote Fling", "Tải Animation Thất Bại.", 2)
+            return
+        end
+
+        EmoteFlingConfig.Active = true
+        ModuleState.EmoteFlingActive = true
+        EmoteFlingTrack = track
+
+        local animStopped = false
+        local trackStoppedConn
+        trackStoppedConn = track.Stopped:Once(function()
+            animStopped = true
+            if trackStoppedConn then pcall(function() trackStoppedConn:Disconnect() end) end
+        end)
+
+        track.Priority = Enum.AnimationPriority.Action
+        track.Looped = false
+        track:Play()
+
+        Notify("Emote Fling", "Đã Kích Hoạt! Bấm phím tắt để dừng lại.", 2)
+
+        local flip = 1
+        local timeout = tick() + 300 
+
+        while EmoteFlingConfig.Active and not animStopped do
+            if tick() > timeout then break end
+            RunService.Heartbeat:Wait()
+
+            local c = LocalPlayer.Character
+            local r = c and c:FindFirstChild("HumanoidRootPart")
+            local h = c and c:FindFirstChildWhichIsA("Humanoid")
+
+            if r and h then
+                local dir = h.MoveDirection
+                flip = flip * -1
+                r.AssemblyLinearVelocity = Vector3.new(100000 * flip, 0, 100000 * flip)
+                r.AssemblyAngularVelocity = Vector3.new(100000 * flip, 100000 * flip, 100000 * flip)
+
+                RunService.RenderStepped:Wait()
+
+                if not EmoteFlingConfig.Active then break end
+
+                if dir.Magnitude > 0 then
+                    local spd = EmoteFlingConfig.Speed
+                    r.AssemblyLinearVelocity = Vector3.new(dir.X * spd, -2, dir.Z * spd)
+                    r.Velocity = Vector3.new(dir.X * spd, -2, dir.Z * spd)
+                else
+                    r.AssemblyLinearVelocity = Vector3.new(0, -2, 0)
+                    r.Velocity = Vector3.new(0, -2, 0)
+                end
+                r.AssemblyAngularVelocity = Vector3.zero
+                r.RotVelocity = Vector3.zero
+            else
+                break
+            end
+        end
+
+        EmoteFlingCleanup()
+        Notify("Emote Fling", "Vật lý nhân vật đã phục hồi.", 2)
+    end)
+end
+
+-- ============================================================================
+-- ĐĂNG KÝ VÀ KHỞI TẠO CÁC PHẦN TỬ TRÊN KHUNG CHÍNH (XÂY DỰNG GIAO DIỆN)
+-- ============================================================================
+CreateSection("Kích Hoạt Emote", 1)
+
+local toggleEnable = CreateToggle("Bật Emote Fling", EmoteFlingConfig.Armed, 2, function(state)
+    EmoteFlingConfig.Armed = state
+    if not state and EmoteFlingConfig.Active then
+        EmoteFlingConfig.Active = false
+    end
+    SaveConfig()
+end)
+
+CreateDropdown("Chọn Động Tác", PresetNames, GetPresetNameFromId(EmoteFlingConfig.AnimId), 3, function(selected)
+    if EmoteFlingConfig.UseCustomId then return end
+    EmoteFlingConfig.AnimId = PresetAnimations[selected] or "123284315754700"
+    SaveConfig()
+end)
+
+CreateToggle("Dùng Animation ID Tự Chọn", EmoteFlingConfig.UseCustomId, 4, function(state)
+    EmoteFlingConfig.UseCustomId = state
+    if state then
+        EmoteFlingConfig.AnimId = EmoteFlingConfig.CustomId or ""
+    else
+        EmoteFlingConfig.AnimId = PresetAnimations["Idle"] or "123284315754700" 
+    end
+    SaveConfig()
+end)
+
+CreateInput("ID Hoạt Ảnh Tự Chọn", "Nhập ID...", EmoteFlingConfig.CustomId, 5, function(text)
+    EmoteFlingConfig.CustomId = text
+    if EmoteFlingConfig.UseCustomId then
+        EmoteFlingConfig.AnimId = text
+    end
+    SaveConfig()
+end)
+
+CreateSlider("Tốc Độ Di Chuyển", 16, 200, EmoteFlingConfig.Speed, 6, function(val)
+    EmoteFlingConfig.Speed = val
+    SaveConfig()
+end)
+
+CreateButton("Kích Hoạt / Dừng Fling", 7, function()
+    FireEmoteFling()
+end)
+
+CreateKeybind("Phím Tắt Kích Hoạt", EmoteFlingConfig.QuickFireKey, 8, function(key)
+    EmoteFlingConfig.QuickFireKey = key
+    SaveConfig()
+end)
+
+CreateKeybind("Phím Ẩn/Hiện Menu", EmoteFlingConfig.ToggleKey, 9, function(key)
+    EmoteFlingConfig.ToggleKey = key
+    SaveConfig()
+end)
+
+CreateToggle("Bật Thông Báo Giao Diện", EmoteFlingConfig.NotificationsEnabled, 10, function(state)
+    EmoteFlingConfig.NotificationsEnabled = state
+    SaveConfig()
+end)
+
+-- ============================================================================
+-- PHẦN CÁC TÍNH NĂNG ĐẶC BIỆT (ANTI-FALL / GODMODE / ANTI-FLING / NOCLIP)
+-- ============================================================================
+CreateSection("Bảo Vệ & Gian Lận", 11)
+
+-- 1. Anti-Fall
+local function HookAntiFall(char)
+    task.spawn(function()
+        local r = char:WaitForChild("HumanoidRootPart", 10)
+        if r and EmoteFlingConfig.antiFallEnabled then
+            local rs = game:GetService("RunService")
+            local hb = rs.Heartbeat
+            local rsd = rs.RenderStepped
+            local z = Vector3.zero
+            
+            DisconnectConnection("antiFallLoopConn")
+            local conn = hb:Connect(function()
+                if not EmoteFlingConfig.antiFallEnabled or not r.Parent then
+                    DisconnectConnection("antiFallLoopConn")
+                    return
+                end
+                local v = r.AssemblyLinearVelocity
+                r.AssemblyLinearVelocity = z
+                rsd:Wait()
+                r.AssemblyLinearVelocity = v
+            end)
+            RegisterConnection("antiFallLoopConn", conn)
+        end
+    end)
+end
+
+local antiFallToggle
+local function OnAntiFallToggle(Value, isInitialization)
+    EmoteFlingConfig.antiFallEnabled = Value
+    if EmoteFlingConfig.antiFallEnabled then
+        if game.PlaceId ~= 189707 then
+            if not isInitialization then
+                Notify("Lỗi Kích Hoạt", "Hệ thống Anti-Fall Damage chỉ hỗ trợ bản đồ Natural Disasters!", 5)
+            end
+            EmoteFlingConfig.antiFallEnabled = false
+            if antiFallToggle then pcall(function() antiFallToggle:Set(false) end) end
+            SaveConfig()
+            return
+        end
+
+        if LocalPlayer.Character then HookAntiFall(LocalPlayer.Character) end
+
+        DisconnectConnection("antiFallRespawnConn")
+        local connRespawn = LocalPlayer.CharacterAdded:Connect(function(char)
+            if EmoteFlingConfig.antiFallEnabled then HookAntiFall(char) end
+        end)
+        RegisterConnection("antiFallRespawnConn", connRespawn)
+
+        if not isInitialization then
+            Notify("Anti-Fall Damage", "Kích hoạt thành công (Natural Disasters Survival)", 3)
+        end
+    else
+        DisconnectConnection("antiFallLoopConn")
+        DisconnectConnection("antiFallRespawnConn")
+        if not isInitialization then
+            Notify("Anti-Fall Damage", "Đã tắt tính năng.", 3)
+        end
+    end
+    SaveConfig()
+end
+
+antiFallToggle = CreateToggle("Chống Sát Thương Ngã", EmoteFlingConfig.antiFallEnabled, 12, function(Value)
+    OnAntiFallToggle(Value, not UI_Loaded)
+end)
+
+-- 2. Godmode (Anti-Instakill)
+local function RestoreGodProperties(char)
+    local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+    if hum then
+        pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Physics, true)
+        end)
+    end
+end
+
+local function ApplyGodProperties(char)
+    task.spawn(function()
+        local hum = char:WaitForChild("Humanoid", 10)
+        if hum and EmoteFlingConfig.godEnabled then
+            pcall(function()
+                hum.MaxHealth = 100
+                hum.Health = 100
+                hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+                hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+                hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+            end)
+        end
+    end)
+end
+
+local godToggle
+local function OnGodToggle(Value, isInitialization)
+    EmoteFlingConfig.godEnabled = Value
+    if EmoteFlingConfig.godEnabled then
+        DisconnectConnection("godLoopConn")
+        local connLoop = game:GetService("RunService").Heartbeat:Connect(function()
+            local char = LocalPlayer.Character
+            if char and EmoteFlingConfig.godEnabled then
+                local hum = char:FindFirstChildWhichIsA("Humanoid")
+                if hum then hum.Health = 100 end
+            end
+        end)
+        RegisterConnection("godLoopConn", connLoop)
+
+        if LocalPlayer.Character then ApplyGodProperties(LocalPlayer.Character) end
+
+        DisconnectConnection("godRespawnConn")
+        local connRespawn = LocalPlayer.CharacterAdded:Connect(function(char)
+            if EmoteFlingConfig.godEnabled then ApplyGodProperties(char) end
+        end)
+        RegisterConnection("godRespawnConn", connRespawn)
+
+        if not isInitialization then
+            Notify("Godmode", "Đã kích hoạt chế độ Bất Tử liên tục!", 3)
+        end
+    else
+        DisconnectConnection("godLoopConn")
+        DisconnectConnection("godRespawnConn")
+        if LocalPlayer.Character then RestoreGodProperties(LocalPlayer.Character) end
+        if not isInitialization then
+            Notify("Godmode", "Chế độ Bất Tử đã tắt.", 3)
+        end
+    end
+    SaveConfig()
+end
+
+godToggle = CreateToggle("Godmode (Bất Tử)", EmoteFlingConfig.godEnabled, 13, function(Value)
+    OnGodToggle(Value, not UI_Loaded)
+end)
+
+-- 3. Anti-Fling
+local lastSafeCFrameFling = nil
+local lastNotifyTimeFling = 0
+local isRecoveringFling = false
+
+local function OnAntiFlingToggle(Value, isInitialization)
+    EmoteFlingConfig.antiFlingEnabled = Value
+    if EmoteFlingConfig.antiFlingEnabled then
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            lastSafeCFrameFling = char.HumanoidRootPart.CFrame
+        end
+
+        DisconnectConnection("antiFlingLoopConn")
+        local conn = RunService.Stepped:Connect(function(_, dt)
+            if not EmoteFlingConfig.antiFlingEnabled then return end
+            char = LocalPlayer.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local humanoid = char and char:FindFirstChild("Humanoid")
+            
+            if hrp and humanoid and humanoid.Health > 0 then
+                local velocity = hrp.AssemblyLinearVelocity
+                local rotVelocity = hrp.AssemblyAngularVelocity
+                local mag = velocity.Magnitude
+                local rotMag = rotVelocity.Magnitude
+                
+                if not lastSafeCFrameFling then lastSafeCFrameFling = hrp.CFrame end
+                
+                local isControlledMotion = rotMag < 60 
+                local currentState = humanoid:GetState()
+                local isFalling = velocity.Y < -50 and (currentState == Enum.HumanoidStateType.Freefall or currentState == Enum.HumanoidStateType.FallingDown)
+                
+                local maxLinear = EmoteFlingConfig.Active and 250 or 150
+                local maxVerticalUp = 250
+                local maxVerticalDown = -350
+                
+                if isControlledMotion then
+                    maxLinear = 1000 
+                    maxVerticalUp = 800 
+                    if isFalling then
+                        maxVerticalDown = -5000 
+                    else
+                        maxVerticalDown = -800 
+                    end
+                end
+                
+                local isFlinged = rotMag > 120 
+                               or velocity.Y > maxVerticalUp 
+                               or velocity.Y < maxVerticalDown 
+                               or mag > maxLinear 
+                
+                if isFlinged then
+                    isRecoveringFling = true
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                    
+                    if lastSafeCFrameFling then
+                        hrp.CFrame = lastSafeCFrameFling
+                    end
+                    
+                    if currentState == Enum.HumanoidStateType.Physics or currentState == Enum.HumanoidStateType.Ragdoll or currentState == Enum.HumanoidStateType.FallingDown then
+                        humanoid:ChangeState(Enum.HumanoidStateType.Running)
+                        humanoid.PlatformStand = false
+                        humanoid.Sit = false
+                    end
+                    
+                    if tick() - lastNotifyTimeFling > 2.0 then
+                        Notify("Anti-Fling Protection", "Đã dập tắt hiện tượng bất thường về động năng vật lý.", 1.5)
+                        lastNotifyTimeFling = tick()
+                    end
+                else
+                    local distance = (hrp.Position - lastSafeCFrameFling.Position).Magnitude
+                    if distance > 50 and mag < 100 and not isRecoveringFling then
+                        lastSafeCFrameFling = hrp.CFrame
+                    end
+                    if isControlledMotion and mag < 900 then
+                        lastSafeCFrameFling = hrp.CFrame
+                        isRecoveringFling = false
+                    end
+                end
+            end
+        end)
+        RegisterConnection("antiFlingLoopConn", conn)
+
+        if not isInitialization then
+            Notify("Anti-Fling", "Bảo vệ tuyệt đối khỏi hacker/Fling khác hoạt động.", 2.5)
+        end
+    else
+        DisconnectConnection("antiFlingLoopConn")
+        lastSafeCFrameFling = nil
+        isRecoveringFling = false
+        if not isInitialization then
+            Notify("Anti-Fling", "Đã tắt hệ thống bảo vệ Fling.", 2.5)
+        end
+    end
+    SaveConfig()
+end
+
+CreateToggle("Bảo Vệ Chống Fling", EmoteFlingConfig.antiFlingEnabled, 14, function(Value)
+    OnAntiFlingToggle(Value, not UI_Loaded)
+end)
+
+-- 4. NoClip
+local NoClipStates = setmetatable({}, {__mode = "k"})
+
+local function RestoreNoClip(char)
+    if not char then return end
+    for part, state in pairs(NoClipStates) do
+        if part and part.Parent then part.CanCollide = state end
+    end
+    for k in pairs(NoClipStates) do NoClipStates[k] = nil end
+end
+
+local function HookNoClip(char)
+    DisconnectConnection("noclipLoopConn")
+    DisconnectConnection("noclipAddedConn")
+    if not EmoteFlingConfig.noclipEnabled then return end
+    
+    local parts = {}
+    for k in pairs(NoClipStates) do NoClipStates[k] = nil end
+    
+    local function registerPart(part)
+        if part:IsA("BasePart") then
+            table.insert(parts, part)
+            if NoClipStates[part] == nil then
+                NoClipStates[part] = part.CanCollide
+            end
+        end
+    end
+
+    for _, part in ipairs(char:GetDescendants()) do
+        registerPart(part)
+    end
+
+    local addedConn = char.DescendantAdded:Connect(registerPart)
+    RegisterConnection("noclipAddedConn", addedConn)
+    
+    local conn = RunService.Stepped:Connect(function()
+        if not EmoteFlingConfig.noclipEnabled or not char.Parent then
+            DisconnectConnection("noclipLoopConn")
+            DisconnectConnection("noclipAddedConn")
+            return
+        end
+        for i = 1, #parts do
+            local part = parts[i]
+            if part.Parent and part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end)
+    RegisterConnection("noclipLoopConn", conn)
+end
+
+local function OnNoClipToggle(Value, isInitialization)
+    EmoteFlingConfig.noclipEnabled = Value
+    if EmoteFlingConfig.noclipEnabled then
+        if LocalPlayer.Character then HookNoClip(LocalPlayer.Character) end
+
+        DisconnectConnection("noclipRespawnConn")
+        local connRespawn = LocalPlayer.CharacterAdded:Connect(function(char)
+            if EmoteFlingConfig.noclipEnabled then HookNoClip(char) end
+        end)
+        RegisterConnection("noclipRespawnConn", connRespawn)
+
+        if not isInitialization then
+            Notify("NoClip", "Bật chế độ xuyên tường.", 3)
+        end
+    else
+        DisconnectConnection("noclipLoopConn")
+        DisconnectConnection("noclipRespawnConn")
+        DisconnectConnection("noclipAddedConn")
+        if LocalPlayer.Character then RestoreNoClip(LocalPlayer.Character) end
+        if not isInitialization then
+            Notify("NoClip", "Đã tắt chế độ xuyên tường.", 3)
+        end
+    end
+    SaveConfig()
+end
+
+CreateToggle("Xuyên Vật Thể (NoClip)", EmoteFlingConfig.noclipEnabled, 15, function(Value)
+    OnNoClipToggle(Value, not UI_Loaded)
+end)
+
+-- ============================================================================
+-- SỰ KIỆN QUẢN LÝ TƯƠNG TÁC PHÍM TẮT & HỒI SINH NHÂN VẬT
+-- ============================================================================
+-- Lắng nghe sự kiện bàn phím (Toggle UI & Fling Keybind)
+local globalInputConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.Unknown then return end 
+    
+    -- Phím tắt hiển thị UI
+    if input.KeyCode == EmoteFlingConfig.ToggleKey then
+        MainFrame.Visible = not MainFrame.Visible
+    end
+
+    -- Phím tắt kích hoạt Fling nhanh
+    if EmoteFlingConfig.QuickFireKey and input.KeyCode == EmoteFlingConfig.QuickFireKey then
+        FireEmoteFling()
+    end
+end)
+RegisterConnection("GlobalInputConn", globalInputConn)
+
+-- Xử lý an toàn khi hồi sinh
+DisconnectConnection("charAddedConn")
+local connCharAdded = LocalPlayer.CharacterAdded:Connect(function(newChar)
+    if EmoteFlingConfig.Active then
+        EmoteFlingConfig.Active = false
+        Notify("Emote Fling", "Tiến trình Fling bị dừng do bạn đã hồi sinh.", 2)
+    end
+end)
+RegisterConnection("charAddedConn", connCharAdded)
+
+-- ============================================================================
+-- CHƯƠNG TRÌNH DỌN DẸP TOÀN CỤC CHỐNG RÒ RỈ LỖI (CLEANUP HOOK)
+-- ============================================================================
+local isCleaningUp = false
+_G.EmoteFling_GlobalCleanup = function()
+    if isCleaningUp then return end
+    isCleaningUp = true
+
+    for name, _ in pairs(EventConnections) do
+        DisconnectConnection(name)
+    end
+    
+    if EmoteFlingConfig.Active then
+        EmoteFlingConfig.Active = false
+    end
+    
+    if ScreenGui then
+        pcall(function() ScreenGui:Destroy() end)
+    end
+end
+
+-- ============================================================================
+-- HOÀN TẤT SETUP & SỰ KIỆN KHỞI ĐỘNG BAN ĐẦU
+-- ============================================================================
+UI_Loaded = true
+
+if EmoteFlingConfig.antiFallEnabled and not EventConnections["antiFallRespawnConn"] then
+    OnAntiFallToggle(true, true)
+end
+
+if EmoteFlingConfig.godEnabled and not EventConnections["godRespawnConn"] then
+    OnGodToggle(true, true)
+end
+
+if EmoteFlingConfig.antiFlingEnabled and not EventConnections["antiFlingLoopConn"] then
+    OnAntiFlingToggle(true, true)
+end
+
+if EmoteFlingConfig.noclipEnabled and not EventConnections["noclipLoopConn"] then
+    OnNoClipToggle(true, true)
+end
+
+-- Thông báo khởi động thành công
+if ConfigLoaded then
+    Notify("Hệ Thống Sẵn Sàng", "Đã tải dữ liệu cấu hình đã lưu và đồng bộ.", 3)
+else
+    Notify("Hệ Thống Sẵn Sàng", "Đã khởi tạo với thiết lập mặc định.", 3)
+end
